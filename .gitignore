@@ -54,3 +54,6 @@ __pycache__/
 .vscode/
 .idea/
 .claude/
+deploy/
+*.backup
+intimacoes_BACKUP_*/
