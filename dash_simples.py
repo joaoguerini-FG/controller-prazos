@@ -19,8 +19,24 @@ with open("intimacoes_state.json", "r", encoding="utf-8") as f:
 pubs = state["publicacoes"]
 data_geracao = datetime.now().strftime("%d/%m/%Y %H:%M")
 
+# ============================================================
+# VERSIONAMENTO DO DASHBOARD
+# ============================================================
+VERSAO = "v1.2"
+DATA_VERSAO = "15/04/2026"
+CHANGELOG_V12 = [
+    "INT-ID content-addressable (SHA256 proces+teor)",
+    "Auditoria criptografica: hash chain por publicacao",
+    "Flags NOVA / REPETIDA / ATRASADA",
+    "Deteccao de gaps (dias sem publicacao)",
+    "Exportacao Excel embutida (SheetJS inline)",
+    "Dedup retroativo por teor puro",
+    "Coluna # + filtro por clique nas celulas",
+    "Chips de filtros ativos com X para remover",
+]
+
 DATAJURI_URL = "https://dj33.datajuri.com.br/app/#/lista/Processo/"
-DATAJURI_TAB = "?relDir=asc&relSize=20&relPagina=1&tab=HistoricoAtividades"
+DATAJURI_TAB = "?relDir=asc&relSize=20&relPagina=1&tab=AtividadesAbertas"
 
 rows = []
 for pub in pubs:
@@ -45,6 +61,19 @@ for pub in pubs:
     gt_status = gt_v3.get("status", "")
     gt_regra = gt_v3.get("regra_gt_sugerida", "") or ""
     gt_sim = gt_v3.get("similaridade_max", 0)
+
+    # Dedup info (camada 2 - SHA256 teor puro)
+    dedup_status = pub.get("_dedup", "") or ""
+    duplicata_de = pub.get("_duplicata_de", "") or ""
+    is_duplicata = dedup_status == "DUPLICATA_TEOR_PURO"
+
+    # Auditoria content-addressable
+    intimacao_id = pub.get("intimacao_id", "") or ""
+    audit = pub.get("audit", {}) or {}
+    status_flags = audit.get("status_flags", []) if isinstance(audit.get("status_flags"), list) else []
+    is_atrasada = "ATRASADA" in status_flags
+    is_repetida = "REPETIDA" in status_flags
+    is_nova = "NOVA" in status_flags and not is_repetida
 
     rows.append({
         "processo": esc(processo),
@@ -72,11 +101,69 @@ for pub in pubs:
         "gt_status": esc(gt_status),
         "gt_regra": esc(gt_regra),
         "gt_sim": esc(str(round(gt_sim, 2))) if gt_sim else "",
+        "dedup_status": esc(dedup_status),
+        "duplicata_de": esc(str(duplicata_de)) if duplicata_de else "",
+        "is_duplicata": is_duplicata,
+        "intimacao_id": esc(intimacao_id),
+        "status_flags": status_flags,
+        "is_atrasada": is_atrasada,
+        "is_repetida": is_repetida,
+        "is_nova": is_nova,
     })
+
+# Agrupamento por INT-ID (pubs com mesmo conteudo juridico ficam juntas)
+from collections import Counter as _Counter
+_grupo_count = _Counter(r.get("intimacao_id","") for r in rows if r.get("intimacao_id"))
+for r in rows:
+    _iid = r.get("intimacao_id","")
+    r["grupo_count"] = _grupo_count.get(_iid, 1) if _iid else 1
+    r["em_grupo_dup"] = r["grupo_count"] > 1
+
+# Ordenacao padrao: (intimacao_id asc, data asc) - duplicatas ficam adjacentes
+rows.sort(key=lambda r: (r.get("intimacao_id","zzz"), r.get("data","")))
+
+# Marcar duplicatas secundarias (2a, 3a, ... ocorrencia do mesmo INT-ID)
+# A primeira ocorrencia e a "original" e fica visivel mesmo com toggle ocultar
+_ja_visto = set()
+for r in rows:
+    _iid = r.get("intimacao_id","")
+    if _iid and _iid in _ja_visto:
+        r["is_dup_secundaria"] = True
+        # Marcar is_duplicata tambem para manter compatibilidade visual
+        if not r.get("is_duplicata"):
+            r["is_duplicata"] = True
+            if not r.get("duplicata_de"):
+                # Achar o pub original (primeiro do grupo)
+                for orig in rows:
+                    if orig.get("intimacao_id") == _iid and not orig.get("is_dup_secundaria"):
+                        r["duplicata_de"] = orig.get("id","")
+                        break
+    else:
+        r["is_dup_secundaria"] = False
+    if _iid:
+        _ja_visto.add(_iid)
+
+# Marcar primeira e ultima linha de cada grupo de duplicados (visualizar como bloco)
+for i, r in enumerate(rows):
+    if not r.get("em_grupo_dup"):
+        continue
+    iid = r.get("intimacao_id","")
+    # Primeira: anterior tem INT-ID diferente
+    if i == 0 or rows[i-1].get("intimacao_id") != iid:
+        r["grupo_dup_first"] = True
+    # Ultima: proxima tem INT-ID diferente
+    if i == len(rows)-1 or rows[i+1].get("intimacao_id") != iid:
+        r["grupo_dup_last"] = True
 
 rows_json = json.dumps(rows, ensure_ascii=False)
 pend = ["PENDENTE","PENDENTE_CLASSIFICACAO","","ERRO_CLASSIFICACAO"]
 total = len(rows)
+duplicatas_count = sum(1 for r in rows if r.get("is_duplicata") or r.get("is_dup_secundaria"))
+grupos_dup_count = sum(1 for r in rows if r.get("em_grupo_dup"))
+atrasadas_count = sum(1 for r in rows if r.get("is_atrasada"))
+repetidas_count = sum(1 for r in rows if r.get("is_repetida"))
+novas_count = sum(1 for r in rows if r.get("is_nova"))
+ids_unicos_count = len(set(r.get("intimacao_id","") for r in rows if r.get("intimacao_id")))
 alta = sum(1 for r in rows if r["confianca"] == "ALTA")
 media = sum(1 for r in rows if r["confianca"] == "MEDIA")
 baixa = sum(1 for r in rows if r["confianca"] == "BAIXA" and r["regra"] not in pend)
@@ -135,7 +222,9 @@ body.light .header{background:#FFFFFF}
 .header-brand{display:flex;align-items:center;gap:24px;flex:1;min-width:0}
 .header-brand img{height:56px;width:auto;display:block}
 .header-divider{width:1px;height:48px;background:rgba(10,30,61,0.15);flex-shrink:0}
-.header-title h1{font-size:18px;font-weight:800;color:var(--advisian-navy);letter-spacing:-0.4px;text-transform:uppercase}
+.header-title h1{font-size:18px;font-weight:800;color:var(--advisian-navy);letter-spacing:-0.4px;text-transform:uppercase;display:inline-flex;align-items:center;gap:10px}
+.version-tag{display:inline-block;background:linear-gradient(135deg,var(--advisian-red),#B02330);color:#FFFFFF;padding:3px 10px;border-radius:12px;font-size:10px;font-weight:800;letter-spacing:0.5px;cursor:help;text-transform:none;white-space:pre-line;box-shadow:0 2px 6px rgba(212,48,60,0.3)}
+.version-tag:hover{transform:translateY(-1px);box-shadow:0 4px 10px rgba(212,48,60,0.4)}
 .header-title .sub{color:#64748B;font-size:12px;margin-top:4px;font-weight:500;letter-spacing:0.3px}
 
 /* ============ TECH CREDENTIALS ============ */
@@ -215,7 +304,51 @@ body.light a{color:var(--advisian-navy)}
 /* ============ BRAND ACCENT ============ */
 .badge-ia{background:linear-gradient(135deg,var(--advisian-navy),var(--advisian-navy-light));color:#FFFFFF;padding:2px 6px;border-radius:3px;font-weight:800;font-size:9px;letter-spacing:1px}
 .badge-ia span{color:var(--advisian-red)}
+.excel-btn{background:#1B6B2D;color:#FFF;border:none;padding:10px 18px;border-radius:8px;cursor:pointer;font-weight:700;font-size:13px;display:inline-flex;align-items:center;gap:8px;transition:all 0.2s;margin-right:8px}
+.excel-btn:hover{background:#12561F;transform:translateY(-1px);box-shadow:0 4px 12px rgba(27,107,45,0.3)}
+.excel-btn svg{width:16px;height:16px}
+.badge-dup{display:inline-block;background:#F59E0B;color:#FFF;padding:2px 6px;border-radius:4px;font-weight:700;font-size:10px;letter-spacing:0.5px;margin-left:6px;cursor:help;text-transform:uppercase}
+.badge-nova{display:inline-block;background:#10B981;color:#FFF;padding:2px 6px;border-radius:4px;font-weight:700;font-size:10px;letter-spacing:0.5px;margin-left:4px;cursor:help;text-transform:uppercase}
+.badge-atrasada{display:inline-block;background:#EF4444;color:#FFF;padding:2px 6px;border-radius:4px;font-weight:700;font-size:10px;letter-spacing:0.5px;margin-left:4px;cursor:help;text-transform:uppercase}
+.badge-repetida{display:inline-block;background:#6366F1;color:#FFF;padding:2px 6px;border-radius:4px;font-weight:700;font-size:10px;letter-spacing:0.5px;margin-left:4px;cursor:help;text-transform:uppercase}
+.int-id{display:inline-block;font-family:'SF Mono','Menlo','Consolas',monospace;background:rgba(10,30,61,0.06);color:var(--advisian-navy);padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:0.3px;border:1px solid rgba(10,30,61,0.15)}
+.audit-toggle{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;background:rgba(10,30,61,0.08);border:1px solid rgba(10,30,61,0.2);border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;color:var(--advisian-navy);margin-left:8px}
+.audit-toggle:hover{background:rgba(10,30,61,0.14)}
+.audit-toggle input{margin:0;cursor:pointer}
+/* Linhas em grupo duplicado: cor cinza sobria + borda amarela agrupadora */
+.row-grupo-dup{background:rgba(100,116,139,0.14);border-left:3px solid #F59E0B}
+.row-grupo-dup:hover{background:rgba(100,116,139,0.22)}
+body.light .row-grupo-dup{background:rgba(100,116,139,0.16)}
+body.light .row-grupo-dup:hover{background:rgba(100,116,139,0.25)}
+/* Duplicata especifica - mesma cinza, so borda mais forte */
+.row-duplicata{background:rgba(100,116,139,0.22);border-left:3px solid #F59E0B}
+.row-duplicata:hover{background:rgba(100,116,139,0.30)}
+/* Bloco visual: primeira linha do grupo tem borda superior amarela */
+.grupo-dup-first td{border-top:2px solid #F59E0B !important}
+/* Bloco visual: ultima linha do grupo tem borda inferior amarela */
+.grupo-dup-last td{border-bottom:2px solid #F59E0B !important}
+/* Cada celula em linha de grupo tem borda lateral sutil pra fechar o bloco visualmente */
+.row-grupo-dup td:first-child,.row-duplicata td:first-child{box-shadow:inset 3px 0 0 #F59E0B}
+.row-grupo-dup td:last-child,.row-duplicata td:last-child{box-shadow:inset -2px 0 0 #F59E0B}
+/* Asterisco vermelho na numeracao de linhas duplicadas */
+.dup-star{color:var(--advisian-red);font-weight:800;margin-left:2px}
+.dedup-toggle{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.3);border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;color:#B45309;margin-left:8px}
+.dedup-toggle:hover{background:rgba(245,158,11,0.18)}
+.dedup-toggle input{margin:0;cursor:pointer}
+td.nr{text-align:center;font-weight:700;color:var(--txt-muted);font-size:12px;background:rgba(10,30,61,0.03);width:52px}
+.pct{display:inline-block;margin-left:6px;font-size:13px;font-weight:500;color:var(--txt-muted);vertical-align:middle;letter-spacing:-0.2px}
+body.light .pct{color:#94A3B8}
+td.clicky{cursor:pointer;transition:background 0.15s}
+td.clicky:hover{background:rgba(10,30,61,0.08);color:var(--advisian-red)}
+.fchip{display:inline-flex;align-items:center;gap:6px;background:#FFFFFF;border:1px solid var(--advisian-red);color:var(--advisian-navy);padding:4px 10px;border-radius:16px;font-size:11px;font-weight:600;box-shadow:0 1px 3px rgba(212,48,60,0.15)}
+.fchip-lbl{color:var(--advisian-red);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:0.3px}
+.fchip-x{cursor:pointer;background:var(--advisian-red);color:#FFF;border-radius:50%;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;line-height:1;margin-left:2px}
+.fchip-x:hover{background:#9B2531}
 </style>
+<!-- XLSX library EMBUTIDA (sem CDN, sem arquivo separado) -->
+<script>
+""" + open("xlsx.full.min.js", "r", encoding="utf-8").read() + """
+</script>
 </head>
 <body>
 <div class="header">
@@ -223,30 +356,29 @@ body.light a{color:var(--advisian-navy)}
 """ + (f'<img src="{LOGO_SRC}" alt="ADVISIAN">' if LOGO_SRC else '<div style="color:#fff;font-size:28px;font-weight:900">ADVIS<span style="color:var(--advisian-red)">IA</span>N</div>') + """
 <div class="header-divider"></div>
 <div class="header-title">
-<h1>Controller de Prazos</h1>
-<div class="sub">Furtado Guerini · """ + data_geracao + """ · Classificação I<span style="color:var(--advisian-red);font-weight:800">A</span></div>
+<h1>Controller de Prazos <span class="version-tag" title="Versão """ + VERSAO + """ publicada em """ + DATA_VERSAO + """\n\nChangelog v1.2:\n- """ + "\n- ".join(CHANGELOG_V12) + """">""" + VERSAO + """</span></h1>
+<div class="sub">Furtado Guerini · Publicado em """ + DATA_VERSAO + """ · Última atualização """ + data_geracao + """ · Classificação I<span style="color:var(--advisian-red);font-weight:800">A</span></div>
 </div>
 </div>
 
 <div class="credentials">
 <div class="cred-pill" title="Dados obtidos diretamente da API pública do Conselho Nacional de Justiça"><svg class="cred-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L3 7l9 5 9-5-9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg><span><span class="cred-label">Fonte</span><strong>API DJEN/CNJ</strong></span></div>
 
-<div class="cred-pill" title="Motor de classificação IA de última geração"><svg class="cred-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0H5a2 2 0 01-2-2v-4m6 6h10a2 2 0 002-2v-4M3 9h18M3 15h18"/></svg><span><span class="cred-label">Motor</span><strong>GPT-4.1</strong></span></div>
-
-<div class="cred-pill" title="Base de ground truth extraída do cruzamento DJEN × DataJuri"><svg class="cred-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg><span><span class="cred-label">Precedentes</span><strong>22.625</strong></span></div>
+<div class="cred-pill" title="Motor de classificação: Claude Opus 4.6 (Anthropic)"><svg class="cred-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0H5a2 2 0 01-2-2v-4m6 6h10a2 2 0 002-2v-4M3 9h18M3 15h18"/></svg><span><span class="cred-label">Motor</span><strong>Opus 4.6</strong></span></div>
 
 <div class="cred-pill" title="170 regras de workflow do DataJuri mapeadas"><svg class="cred-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg><span><span class="cred-label">Workflows</span><strong>170 regras</strong></span></div>
 
+<button class="excel-btn" onclick="exportarExcel()" title="Exportar linhas filtradas para Excel (XLSX)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>Exportar Excel</button>
 <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">🌙 Escuro</button>
 </div>
 </div>
 
 <div class="stats" id="statsContainer">
 <div class="sc" data-filter="all"><div class="n" style="color:var(--advisian-navy-light)" id="st">""" + str(total) + """</div><div class="l">Total</div></div>
-<div class="sc" data-filter="workflow"><div class="n" style="color:var(--success)" id="sw">""" + str(workflows) + """</div><div class="l">Workflows</div></div>
-<div class="sc" data-filter="regra:MANUAL"><div class="n" style="color:#FB923C" id="sr">""" + str(manual) + """</div><div class="l">Manual</div></div>
-<div class="sc" data-filter="regra:INFORMATIVO_SEM_PRAZO"><div class="n" style="color:var(--advisian-navy-light)" id="si">""" + str(info) + """</div><div class="l">Informativo</div></div>
-<div class="sc" data-filter="regra:PENDENTE"><div class="n" style="color:var(--txt-dim)" id="sp">""" + str(pendentes) + """</div><div class="l">Pendentes</div></div>
+<div class="sc" data-filter="workflow"><div class="n" style="color:var(--success)" id="sw">""" + str(workflows) + """<span class="pct">""" + (f" {round(workflows/total*100)}%" if total else "") + """</span></div><div class="l">Workflows</div></div>
+<div class="sc" data-filter="regra:MANUAL"><div class="n" style="color:#FB923C" id="sr">""" + str(manual) + """<span class="pct">""" + (f" {round(manual/total*100)}%" if total else "") + """</span></div><div class="l">Manual</div></div>
+<div class="sc" data-filter="regra:INFORMATIVO_SEM_PRAZO"><div class="n" style="color:var(--advisian-navy-light)" id="si">""" + str(info) + """<span class="pct">""" + (f" {round(info/total*100)}%" if total else "") + """</span></div><div class="l">Informativo</div></div>
+<div class="sc" data-filter="regra:PENDENTE"><div class="n" style="color:var(--txt-dim)" id="sp">""" + str(pendentes) + """<span class="pct">""" + (f" {round(pendentes/total*100)}%" if total else "") + """</span></div><div class="l">Pendentes</div></div>
 </div>
 
 <div class="filters">
@@ -257,11 +389,15 @@ body.light a{color:var(--advisian-navy)}
 <div class="fg"><label>Data</label><button class="multi-btn" data-filter="fd">Todas</button><div class="multi-dropdown"><div class="multi-actions"><button onclick="selectAll('fd')">Todos</button><button onclick="clearAll('fd')">Limpar</button></div><div class="multi-opts" id="opts-fd"></div></div></div>
 <div class="fg"><label>Regra</label><button class="multi-btn" data-filter="fr">Todas</button><div class="multi-dropdown"><div class="multi-actions"><button onclick="selectAll('fr')">Todos</button><button onclick="clearAll('fr')">Limpar</button></div><div class="multi-opts" id="opts-fr"></div></div></div>
 <div class="fg"><label>Buscar</label><input type="text" id="fb" oninput="f()" placeholder="processo..." style="width:200px"></div>
+<div class="fg"><label style="opacity:0">Dedup</label><label class="dedup-toggle" title="Ocultar """ + str(duplicatas_count) + """ duplicatas detectadas por SHA256 de teor puro"><input type="checkbox" id="hideDupes" onchange="f()" checked>Ocultar duplicatas (""" + str(duplicatas_count) + """)</label></div>
 <div class="fg"><label style="opacity:0">Clear</label><button class="multi-btn" onclick="clearAllFilters()" style="background:rgba(212,48,60,0.08);color:var(--advisian-red);border-color:rgba(212,48,60,0.3);min-width:100px;text-align:center;font-weight:700">Limpar tudo</button></div>
 </div>
 
 <div class="tc">
+<div id="filterChips" style="padding:8px 20px;display:none;flex-wrap:wrap;gap:6px;background:rgba(212,48,60,0.04);border-bottom:1px solid var(--border-light)"></div>
 <table><thead><tr>
+<th style="width:52px;text-align:center;color:var(--advisian-red);font-weight:800" title="Numeração sequencial (atualiza com filtros)">#</th>
+<th style="width:120px" title="ID content-addressable: mesmo conteúdo = mesmo ID (duplicatas compartilham)">INT-ID</th>
 <th onclick="s(0)">Processo</th><th onclick="s(1)">Data</th><th onclick="s(2)">Natureza</th>
 <th onclick="s(3)">Tribunal</th><th onclick="s(4)">Tipo Doc</th><th onclick="s(5)">Regra</th>
 <th onclick="s(6)">Confiança</th><th onclick="s(7)">Prazo</th><th>GT V4</th><th>Teor da Intimação</th><th>Flags</th>
@@ -270,7 +406,7 @@ body.light a{color:var(--advisian-navy)}
 
 <script>
 const LOGO_SRC = \"""" + LOGO_SRC + """\";
-var D=""" + rows_json + """;
+var PUBS=""" + rows_json + """;
 var sc=-1,sa=true;
 var filters={fn:[],fc:[],ft:[],ftd:[],fd:[],fr:[]};
 var cardFilter=null;
@@ -287,7 +423,7 @@ function bg(c){if(!c)return'';var m={'ALTA':'b-a','MEDIA':'b-m','BAIXA':'b-b'};r
 function rg(r){if(!r)return'';if(r.indexOf('MANUAL')>=0||r.indexOf('NENHUMA')>=0)return'<span class="b b-man">'+r+'</span>';if(r=='INFORMATIVO_SEM_PRAZO')return'<span class="b b-info">INFORMATIVO</span>';if(r=='PENDENTE'||r=='PENDENTE_CLASSIFICACAO'||r=='ERRO_CLASSIFICACAO')return'<span class="b b-p">'+r+'</span>';return r;}
 
 function openVL(idx){
-  var r=D[idx];
+  var r=PUBS[idx];
   var txt=(r.texto||'').replace(/\\\\n/g,'\\n').replace(/\\n/g,' ');
   var clean=txt;
   clean=clean.replace(/[#.]?[a-zA-Z][\\w-]*\\s*\\{[^}]*\\}/g,' ');
@@ -421,11 +557,23 @@ function openVL(idx){
 
 function render(rows){
   var tb=document.getElementById('tb');
-  if(!rows.length){tb.innerHTML='<tr><td colspan="11" class="empty">Nenhuma publicação encontrada</td></tr>';return;}
+  if(!rows.length){tb.innerHTML='<tr><td colspan="13" class="empty">Nenhuma publicação encontrada</td></tr>';renderChips();return;}
   var h='';
   for(var i=0;i<rows.length;i++){
-    var r=rows[i];var oi=D.indexOf(r);
+    var r=rows[i];var oi=PUBS.indexOf(r);
     var rc=r.regra.indexOf('MANUAL')>=0||r.regra.indexOf('NENHUMA')>=0?'rm':r.confianca=='BAIXA'?'rb':'';
+    // Agrupamento: qualquer linha em grupo de duplicados recebe cor sobria
+    if(r.em_grupo_dup)rc+=(rc?' ':'')+'row-grupo-dup';
+    if(r.is_duplicata)rc+=(rc?' ':'')+'row-duplicata';
+    // Bordas do bloco amarelo (apenas quando duplicatas realmente adjacentes nos filtros visiveis)
+    // Recomputa em tempo real: se linha anterior na tabela renderizada nao tem mesmo INT-ID, esta e primeira
+    var prevR=i>0?rows[i-1]:null;
+    var nextR=i<rows.length-1?rows[i+1]:null;
+    if(r.em_grupo_dup){
+      if(!prevR||prevR.intimacao_id!==r.intimacao_id)rc+=' grupo-dup-first';
+      if(!nextR||nextR.intimacao_id!==r.intimacao_id)rc+=' grupo-dup-last';
+    }
+    var dupBadge=r.is_duplicata?'<span class="badge-dup" title="Duplicata de pub '+r.duplicata_de+' (mesmo teor jurídico, SHA256 match)">DUP</span>':'';
     var dj=r.dj_url?'<a class="dj" href="'+r.dj_url+'" target="_blank" onclick="event.stopPropagation()">'+r.processo+'</a>':r.processo;
     var dl=r.djen_link?' <a href="'+r.djen_link+'" target="_blank" onclick="event.stopPropagation()" style="font-size:10px;color:#64748B">[DJEN]</a>':'';
     var teor=(r.texto||'').replace(/<[^>]+>/g,' ').replace(/\\s+/g,' ').trim();
@@ -434,27 +582,96 @@ function render(rows){
     if(r.gt_status==='CONCORDA')gtHtml='<span class="b b-a" title="GT confirma: '+r.gt_regra+'">✓ '+r.gt_sim+'</span>';
     else if(r.gt_status==='CONFLITO')gtHtml='<span class="b b-b" title="GT sugere: '+r.gt_regra+' (sim: '+r.gt_sim+')">⚠ '+r.gt_sim+'</span>';
     else if(r.gt_status==='PRECEDENTE_FRACO')gtHtml='<span class="b b-p" title="Precedente fraco">~</span>';
-    h+='<tr class="'+rc+'" onclick="openVL('+oi+')"><td>'+dj+dl+'</td><td style="white-space:nowrap">'+r.data+'</td><td>'+r.natureza+'</td><td>'+r.tribunal+'</td><td>'+r.tipo_doc+'</td><td>'+rg(r.regra)+'</td><td>'+bg(r.confianca)+'</td><td style="font-weight:800;color:#D4303C">'+(r.prazo?r.prazo+'d':'')+'</td><td>'+gtHtml+'</td><td class="obs">'+teor+'</td><td class="flag">'+r.flags+'</td></tr>';
+    // INT-ID célula (monospace, content-addressable)
+    var intIdShort=r.intimacao_id?r.intimacao_id.replace('INT-',''):'';
+    var intIdHtml=r.intimacao_id?'<span class="int-id" title="ID content-addressable: '+r.intimacao_id+'">'+intIdShort+'</span>':'';
+    // Celulas clicaveis: natureza, tribunal, tipo_doc, regra — click adiciona ao filtro
+    var cellN='<td class="clicky" onclick="event.stopPropagation();quickFilter(\\'fn\\','+JSON.stringify(r.natureza).replace(/"/g,'&quot;')+')" title="Clique para filtrar">'+r.natureza+'</td>';
+    var cellT='<td class="clicky" onclick="event.stopPropagation();quickFilter(\\'ft\\','+JSON.stringify(r.tribunal).replace(/"/g,'&quot;')+')" title="Clique para filtrar">'+r.tribunal+'</td>';
+    var cellTD='<td class="clicky" onclick="event.stopPropagation();quickFilter(\\'ftd\\','+JSON.stringify(r.tipo_doc).replace(/"/g,'&quot;')+')" title="Clique para filtrar">'+r.tipo_doc+'</td>';
+    var cellR='<td class="clicky" onclick="event.stopPropagation();quickFilter(\\'fr\\','+JSON.stringify(r.regra).replace(/"/g,'&quot;')+')" title="Clique para filtrar">'+rg(r.regra)+'</td>';
+    var cellC='<td class="clicky" onclick="event.stopPropagation();quickFilter(\\'fc\\','+JSON.stringify(r.confianca).replace(/"/g,'&quot;')+')" title="Clique para filtrar">'+bg(r.confianca)+'</td>';
+    var numCell=(i+1)+(r.em_grupo_dup?'<span class="dup-star" title="Publicação em grupo de duplicatas">*</span>':'');
+    h+='<tr class="'+rc+'" onclick="openVL('+oi+')"><td class="nr">'+numCell+'</td><td>'+intIdHtml+'</td><td>'+dj+dl+dupBadge+'</td><td style="white-space:nowrap">'+r.data+'</td>'+cellN+cellT+cellTD+cellR+cellC+'<td style="font-weight:800;color:#D4303C">'+(r.prazo?r.prazo+'d':'')+'</td><td>'+gtHtml+'</td><td class="obs">'+teor+'</td><td class="flag">'+r.flags+'</td></tr>';
   }
   tb.innerHTML=h;
   updateStats(rows);
+  renderChips();
+}
+
+// Filtro por clique: adiciona valor ao multi-select
+function quickFilter(filterId, valor){
+  var checkbox=document.querySelector('#opts-'+filterId+' input[data-val="'+valor.replace(/"/g,'\\\\"')+'"]');
+  if(checkbox){
+    if(!checkbox.checked){
+      checkbox.checked=true;
+      updateMultiFilter(filterId);
+    }
+  }
+}
+
+// Renderiza chips de filtros ativos
+function renderChips(){
+  var container=document.getElementById('filterChips');
+  if(!container)return;
+  var chips=[];
+  var labels={fn:'Natureza',fc:'Confiança',ft:'Tribunal',ftd:'Tipo Doc',fd:'Data',fr:'Regra'};
+  ['fn','fc','ft','ftd','fd','fr'].forEach(function(fid){
+    var marcados=Array.from(document.querySelectorAll('#opts-'+fid+' input:checked')).map(function(x){return x.dataset.val;});
+    marcados.forEach(function(v){
+      if(!v)return;
+      chips.push('<span class="fchip" data-fid="'+fid+'" data-val="'+v.replace(/"/g,'&quot;')+'"><span class="fchip-lbl">'+labels[fid]+':</span> '+v+' <span class="fchip-x" onclick="removeChipFilter(\\''+fid+'\\','+JSON.stringify(v).replace(/"/g,'&quot;')+')">×</span></span>');
+    });
+  });
+  // Toggles extras (NOVAS, REPETIDAS, ATRASADAS, Dedup)
+  if(document.getElementById('filterNova') && document.getElementById('filterNova').checked) chips.push('<span class="fchip" style="border-color:#10B981"><span class="fchip-lbl" style="color:#065F46">Status:</span> NOVAS <span class="fchip-x" style="background:#10B981" onclick="document.getElementById(\\'filterNova\\').checked=false;f()">×</span></span>');
+  if(document.getElementById('filterRepetida') && document.getElementById('filterRepetida').checked) chips.push('<span class="fchip" style="border-color:#6366F1"><span class="fchip-lbl" style="color:#3730A3">Status:</span> REPETIDAS <span class="fchip-x" style="background:#6366F1" onclick="document.getElementById(\\'filterRepetida\\').checked=false;f()">×</span></span>');
+  if(document.getElementById('filterAtrasada') && document.getElementById('filterAtrasada').checked) chips.push('<span class="fchip" style="border-color:#EF4444"><span class="fchip-lbl" style="color:#991B1B">Status:</span> ATRASADAS <span class="fchip-x" style="background:#EF4444" onclick="document.getElementById(\\'filterAtrasada\\').checked=false;f()">×</span></span>');
+  var busca=document.getElementById('fb').value;
+  if(busca)chips.push('<span class="fchip"><span class="fchip-lbl">Busca:</span> '+busca+' <span class="fchip-x" onclick="document.getElementById(\\'fb\\').value=\\'\\';f()">×</span></span>');
+  if(cardFilter&&cardFilter!=='all')chips.push('<span class="fchip"><span class="fchip-lbl">Card:</span> '+cardFilter+' <span class="fchip-x" onclick="cardFilter=null;document.querySelectorAll(\\'.sc\\').forEach(function(x){x.classList.remove(\\'active\\')});applyFilters()">×</span></span>');
+  container.innerHTML=chips.join('');
+  container.style.display=chips.length?'flex':'none';
+}
+
+function removeChipFilter(fid, valor){
+  var cb=document.querySelector('#opts-'+fid+' input[data-val="'+valor.replace(/"/g,'\\\\"')+'"]');
+  if(cb){cb.checked=false;updateMultiFilter(fid);}
 }
 
 function updateStats(rows){
   var pend=['PENDENTE','PENDENTE_CLASSIFICACAO','','ERRO_CLASSIFICACAO'];
   var excl=pend.concat(['INFORMATIVO_SEM_PRAZO']);
-  document.getElementById('st').textContent=rows.length;
-  document.getElementById('sw').textContent=rows.filter(function(r){return r.regra&&excl.indexOf(r.regra)<0&&r.regra.indexOf('MANUAL')<0&&r.regra.indexOf('NENHUMA')<0}).length;
-  document.getElementById('sr').textContent=rows.filter(function(r){return r.regra.indexOf('MANUAL')>=0||r.regra.indexOf('NENHUMA')>=0}).length;
-  document.getElementById('si').textContent=rows.filter(function(r){return r.regra=='INFORMATIVO_SEM_PRAZO'}).length;
-  document.getElementById('sp').textContent=rows.filter(function(r){return pend.indexOf(r.regra)>=0}).length;
+  var total=rows.length;
+  var nW=rows.filter(function(r){return r.regra&&excl.indexOf(r.regra)<0&&r.regra.indexOf('MANUAL')<0&&r.regra.indexOf('NENHUMA')<0}).length;
+  var nR=rows.filter(function(r){return r.regra.indexOf('MANUAL')>=0||r.regra.indexOf('NENHUMA')>=0}).length;
+  var nI=rows.filter(function(r){return r.regra=='INFORMATIVO_SEM_PRAZO'}).length;
+  var nP=rows.filter(function(r){return pend.indexOf(r.regra)>=0}).length;
+  function pct(n){return total>0?' '+Math.round(n/total*100)+'%':'';}
+  document.getElementById('st').textContent=total;
+  document.getElementById('sw').innerHTML=nW+'<span class="pct">'+pct(nW)+'</span>';
+  document.getElementById('sr').innerHTML=nR+'<span class="pct">'+pct(nR)+'</span>';
+  document.getElementById('si').innerHTML=nI+'<span class="pct">'+pct(nI)+'</span>';
+  document.getElementById('sp').innerHTML=nP+'<span class="pct">'+pct(nP)+'</span>';
   if(document.getElementById('sgc'))document.getElementById('sgc').textContent=rows.filter(function(r){return r.gt_status==='CONCORDA'}).length;
   if(document.getElementById('sgk'))document.getElementById('sgk').textContent=rows.filter(function(r){return r.gt_status==='CONFLITO'}).length;
 }
 
 function applyFilters(){
   var busca=document.getElementById('fb').value.toLowerCase();
-  var r=D.filter(function(x){
+  var hideDupesEl=document.getElementById('hideDupes');
+  var hideDupes=hideDupesEl?hideDupesEl.checked:false;
+  var filterNova=document.getElementById('filterNova');
+  var onlyNova=filterNova?filterNova.checked:false;
+  var filterRep=document.getElementById('filterRepetida');
+  var onlyRep=filterRep?filterRep.checked:false;
+  var filterAtr=document.getElementById('filterAtrasada');
+  var onlyAtr=filterAtr?filterAtr.checked:false;
+  var r=PUBS.filter(function(x){
+    if(hideDupes&&(x.is_duplicata||x.is_dup_secundaria))return false;
+    if(onlyNova&&!x.is_nova)return false;
+    if(onlyRep&&!x.is_repetida)return false;
+    if(onlyAtr&&!x.is_atrasada)return false;
     if(filters.fn.length>0&&filters.fn.indexOf(x.natureza)<0)return false;
     if(filters.fc.length>0&&filters.fc.indexOf(x.confianca)<0)return false;
     if(filters.ft.length>0&&filters.ft.indexOf(x.tribunal)<0)return false;
@@ -518,6 +735,194 @@ function selectAll(id){document.querySelectorAll('#opts-'+id+' input').forEach(f
 function clearAll(id){document.querySelectorAll('#opts-'+id+' input').forEach(function(cb){cb.checked=false});updateMultiFilter(id);}
 function clearAllFilters(){['fn','fc','ft','ftd','fd','fr'].forEach(function(id){clearAll(id)});document.getElementById('fb').value='';cardFilter=null;document.querySelectorAll('.sc').forEach(function(x){x.classList.remove('active')});applyFilters();}
 
+// ============================================================
+// EXPORTAR EXCEL (XLSX)
+// ============================================================
+function exportarExcel(){
+  if(typeof XLSX==='undefined'){
+    alert('Biblioteca XLSX nao carregou. Verifique conexao com internet.');
+    return;
+  }
+  // Recomputa lista filtrada com base nos filtros atuais (mesma logica de applyFilters)
+  var filtros=getAllFilters();
+  var filtrados=PUBS.filter(function(r){return matchFilters(r,filtros);});
+
+  if(filtrados.length===0){
+    alert('Nenhuma linha filtrada para exportar. Ajuste os filtros.');
+    return;
+  }
+
+  // Separar principais vs duplicatas
+  var principais=filtrados.filter(function(r){return !r.is_duplicata;});
+  var duplicatas=filtrados.filter(function(r){return r.is_duplicata;});
+
+  // Montar linhas para Excel com colunas relevantes
+  function montarLinha(r){
+    return {
+      'Processo': r.processo||'',
+      'Data': r.data||'',
+      'Natureza': r.natureza||'',
+      'Tribunal': r.tribunal||'',
+      'Tipo Documento': r.tipo_doc||'',
+      'Regra (Workflow)': r.regra||'',
+      'Confianca': r.confianca||'',
+      'Prazo (dias)': r.prazo||'',
+      'Dedup Status': r.dedup_status||'',
+      'Duplicata De (pub_id)': r.duplicata_de||'',
+      'Justificativa IA': r.justificativa||'',
+      'Observacoes': r.observacoes||'',
+      'Flags': r.flags||'',
+      'Cliente': r.cliente||'',
+      'Adverso': r.adverso||'',
+      'Assunto DataJuri': r.assunto_dj||'',
+      'Tipo Acao': r.tipo_acao||'',
+      'Fase Atual': r.fase_atual||'',
+      'Valor da Causa': r.valor_causa||'',
+      'GT Status': r.gt_status||'',
+      'GT Regra Sugerida': r.gt_regra||'',
+      'GT Similaridade': r.gt_sim||'',
+      'Link DJEN': r.djen_link||'',
+      'Link DataJuri': r.dj_url||'',
+      'Texto Integra da Publicacao': (r.texto||'').replace(/\\\\n/g,'\\n'),
+    };
+  }
+  var rows=principais.map(montarLinha);
+  var rowsDup=duplicatas.map(montarLinha);
+
+  // Criar workbook
+  var wb=XLSX.utils.book_new();
+
+  // Aba 1: Principais (sem duplicatas)
+  var colWidths=[
+    {wch:22}, // Processo
+    {wch:12}, // Data
+    {wch:14}, // Natureza
+    {wch:10}, // Tribunal
+    {wch:16}, // Tipo Doc
+    {wch:36}, // Regra
+    {wch:10}, // Confianca
+    {wch:8},  // Prazo
+    {wch:22}, // Dedup Status
+    {wch:14}, // Duplicata De
+    {wch:60}, // Justificativa
+    {wch:40}, // Observacoes
+    {wch:20}, // Flags
+    {wch:22}, // Cliente
+    {wch:22}, // Adverso
+    {wch:22}, // Assunto DJ
+    {wch:20}, // Tipo Acao
+    {wch:18}, // Fase
+    {wch:14}, // Valor
+    {wch:12}, // GT Status
+    {wch:28}, // GT Regra
+    {wch:10}, // GT Sim
+    {wch:40}, // Link DJEN
+    {wch:40}, // Link DataJuri
+    {wch:80}, // Texto
+  ];
+  var ws=XLSX.utils.json_to_sheet(rows);
+  ws['!cols']=colWidths;
+  XLSX.utils.book_append_sheet(wb,ws,'Publicacoes ('+rows.length+')');
+
+  // Aba 2: Duplicatas detectadas (se houver)
+  if(rowsDup.length>0){
+    var wsDup=XLSX.utils.json_to_sheet(rowsDup);
+    wsDup['!cols']=colWidths;
+    XLSX.utils.book_append_sheet(wb,wsDup,'Duplicatas ('+rowsDup.length+')');
+  }
+
+  // Resumo por regra (principais apenas)
+  var resumoStats={};
+  principais.forEach(function(r){
+    var k=r.regra||'?';
+    resumoStats[k]=(resumoStats[k]||0)+1;
+  });
+  var resumoArr=Object.keys(resumoStats).sort(function(a,b){return resumoStats[b]-resumoStats[a];}).map(function(k){
+    return {'Regra':k,'Quantidade':resumoStats[k],'% do Total':((resumoStats[k]/principais.length)*100).toFixed(1)+'%'};
+  });
+  var ws2=XLSX.utils.json_to_sheet(resumoArr);
+  ws2['!cols']=[{wch:40},{wch:12},{wch:12}];
+  XLSX.utils.book_append_sheet(wb,ws2,'Resumo por Regra');
+
+  // Aba 3: Contagens por natureza/tribunal/confianca (principais apenas, sem duplicatas)
+  var natCount={},tribCount={},confCount={};
+  principais.forEach(function(r){
+    natCount[r.natureza||'?']=(natCount[r.natureza||'?']||0)+1;
+    tribCount[r.tribunal||'?']=(tribCount[r.tribunal||'?']||0)+1;
+    confCount[r.confianca||'?']=(confCount[r.confianca||'?']||0)+1;
+  });
+  var agr=[];
+  agr.push({Categoria:'NATUREZA',Valor:'',Quantidade:''});
+  Object.keys(natCount).sort().forEach(function(k){agr.push({Categoria:'',Valor:k,Quantidade:natCount[k]});});
+  agr.push({Categoria:'',Valor:'',Quantidade:''});
+  agr.push({Categoria:'TRIBUNAL',Valor:'',Quantidade:''});
+  Object.keys(tribCount).sort().forEach(function(k){agr.push({Categoria:'',Valor:k,Quantidade:tribCount[k]});});
+  agr.push({Categoria:'',Valor:'',Quantidade:''});
+  agr.push({Categoria:'CONFIANCA',Valor:'',Quantidade:''});
+  Object.keys(confCount).sort().forEach(function(k){agr.push({Categoria:'',Valor:k,Quantidade:confCount[k]});});
+  var ws3=XLSX.utils.json_to_sheet(agr);
+  ws3['!cols']=[{wch:15},{wch:20},{wch:14}];
+  XLSX.utils.book_append_sheet(wb,ws3,'Estatisticas');
+
+  // Nome do arquivo
+  var agora=new Date();
+  var dataStr=agora.toISOString().substring(0,10);
+  var horaStr=agora.toTimeString().substring(0,5).replace(':','h');
+  var sufixo=principais.length+'_pubs';
+  if(rowsDup.length>0) sufixo+='_'+rowsDup.length+'dup';
+  var nome='ADVISIAN_Controller_Prazos_'+dataStr+'_'+horaStr+'_('+sufixo+').xlsx';
+
+  XLSX.writeFile(wb,nome);
+}
+
+// Funcoes auxiliares de filtros (reutilizadas no export)
+function getAllFilters(){
+  var hideDupesEl=document.getElementById('hideDupes');
+  var filterNova=document.getElementById('filterNova');
+  var filterRep=document.getElementById('filterRepetida');
+  var filterAtr=document.getElementById('filterAtrasada');
+  return {
+    fn:Array.from(document.querySelectorAll('#opts-fn input:checked')).map(function(x){return x.dataset.val;}).filter(Boolean),
+    fc:Array.from(document.querySelectorAll('#opts-fc input:checked')).map(function(x){return x.dataset.val;}).filter(Boolean),
+    ft:Array.from(document.querySelectorAll('#opts-ft input:checked')).map(function(x){return x.dataset.val;}).filter(Boolean),
+    ftd:Array.from(document.querySelectorAll('#opts-ftd input:checked')).map(function(x){return x.dataset.val;}).filter(Boolean),
+    fd:Array.from(document.querySelectorAll('#opts-fd input:checked')).map(function(x){return x.dataset.val;}).filter(Boolean),
+    fr:Array.from(document.querySelectorAll('#opts-fr input:checked')).map(function(x){return x.dataset.val;}).filter(Boolean),
+    fb:(document.getElementById('fb').value||'').toLowerCase(),
+    cf:cardFilter,
+    hideDupes:hideDupesEl ? hideDupesEl.checked : false,
+    onlyNova:filterNova?filterNova.checked:false,
+    onlyRep:filterRep?filterRep.checked:false,
+    onlyAtr:filterAtr?filterAtr.checked:false
+  };
+}
+function matchFilters(r,f){
+  if(f.hideDupes && (r.is_duplicata||r.is_dup_secundaria))return false;
+  if(f.onlyNova && !r.is_nova)return false;
+  if(f.onlyRep && !r.is_repetida)return false;
+  if(f.onlyAtr && !r.is_atrasada)return false;
+  if(f.fn.length && f.fn.indexOf(r.natureza)===-1)return false;
+  if(f.fc.length && f.fc.indexOf(r.confianca)===-1)return false;
+  if(f.ft.length && f.ft.indexOf(r.tribunal)===-1)return false;
+  if(f.ftd.length && f.ftd.indexOf(r.tipo_doc)===-1)return false;
+  if(f.fd.length && f.fd.indexOf(r.data)===-1)return false;
+  if(f.fr.length && f.fr.indexOf(r.regra)===-1)return false;
+  if(f.fb && (r.processo||'').toLowerCase().indexOf(f.fb)===-1)return false;
+  if(f.cf){
+    if(f.cf==='workflow' && (!r.regra || r.regra.indexOf('PENDENTE')!==-1 || r.regra.indexOf('MANUAL')!==-1 || r.regra.indexOf('NENHUMA')!==-1 || r.regra==='INFORMATIVO_SEM_PRAZO' || r.regra===''))return false;
+    else if(f.cf.indexOf('regra:')===0){
+      var rr=f.cf.substring(6);
+      if(rr==='MANUAL' && r.regra.indexOf('MANUAL')===-1 && r.regra.indexOf('NENHUMA')===-1)return false;
+      else if(rr==='PENDENTE'){
+        var pend=['PENDENTE','PENDENTE_CLASSIFICACAO','','ERRO_CLASSIFICACAO'];
+        if(pend.indexOf(r.regra)===-1)return false;
+      }
+      else if(rr==='INFORMATIVO_SEM_PRAZO' && r.regra!=='INFORMATIVO_SEM_PRAZO')return false;
+    }
+  }
+  return true;
+}
+
 document.querySelectorAll('.multi-btn[data-filter]').forEach(function(btn){
   btn.addEventListener('click',function(e){
     e.stopPropagation();var dd=btn.nextElementSibling;
@@ -530,22 +935,28 @@ document.addEventListener('click',function(){document.querySelectorAll('.multi-d
 function s(col){
   if(sc==col)sa=!sa;else{sc=col;sa=true;}
   var k=['processo','data','natureza','tribunal','tipo_doc','regra','confianca','prazo'];
-  D.sort(function(a,b){var va=a[k[col]]||'',vb=b[k[col]]||'';return sa?va.localeCompare(vb):vb.localeCompare(va);});
+  PUBS.sort(function(a,b){
+    var va=a[k[col]]||'',vb=b[k[col]]||'';
+    var cmp=sa?va.localeCompare(vb):vb.localeCompare(va);
+    if(cmp!==0)return cmp;
+    // Tiebreaker: agrupa por intimacao_id (mesmo conteudo fica junto)
+    return (a.intimacao_id||'').localeCompare(b.intimacao_id||'');
+  });
   applyFilters();
 }
 
-var tribs=[...new Set(D.map(function(r){return r.tribunal}).filter(Boolean))].sort();
-var datas=[...new Set(D.map(function(r){return r.data}).filter(Boolean))].sort().reverse();
-var regras=[...new Set(D.map(function(r){return r.regra}).filter(Boolean))].sort();
-var tipos=[...new Set(D.map(function(r){return r.tipo_doc}).filter(Boolean))].sort();
-var natur=[...new Set(D.map(function(r){return r.natureza}).filter(Boolean))].sort();
+var tribs=[...new Set(PUBS.map(function(r){return r.tribunal}).filter(Boolean))].sort();
+var datas=[...new Set(PUBS.map(function(r){return r.data}).filter(Boolean))].sort().reverse();
+var regras=[...new Set(PUBS.map(function(r){return r.regra}).filter(Boolean))].sort();
+var tipos=[...new Set(PUBS.map(function(r){return r.tipo_doc}).filter(Boolean))].sort();
+var natur=[...new Set(PUBS.map(function(r){return r.natureza}).filter(Boolean))].sort();
 buildMultiSelect('fn',natur);
 buildMultiSelect('fc',['ALTA','MEDIA','BAIXA']);
 buildMultiSelect('ft',tribs);
 buildMultiSelect('ftd',tipos);
 buildMultiSelect('fd',datas);
 buildMultiSelect('fr',regras);
-render(D);
+render(PUBS);
 </script>
 </body>
 </html>"""
